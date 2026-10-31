@@ -221,12 +221,29 @@ impl Drop for SessionRequest {
 #[derive(Debug, Component)]
 #[require(Session::new(Instant::now(), MIN_MTU))]
 pub struct IrohIo {
+    connection: Connection,
     rx_meta: mpsc::Receiver<SessionMeta>,
     // Incoming packets flow from the async backend into the Bevy frontend.
     rx_packet_from_backend: mpsc::UnboundedReceiver<RecvPacket>,
     // Outgoing packets flow from the Bevy frontend into the async backend.
     tx_packet_to_backend: mpsc::UnboundedSender<Bytes>,
     tx_user_dc: Option<oneshot::Sender<String>>,
+}
+
+impl IrohIo {
+    /// Returns the authenticated Iroh connection for application streams.
+    ///
+    /// Aeronet owns datagram IO and session teardown. Do not send or receive
+    /// datagrams through this handle, or close the connection directly; use
+    /// [`Session`] and [`Disconnect`] instead. Application stream tasks must
+    /// stop when the session disconnects, including any cloned handles.
+    ///
+    /// The connection is exposed only after Aeronet's admission exchange has
+    /// completed. Application streams must use a protocol agreed by both peers.
+    #[must_use]
+    pub const fn connection(&self) -> &Connection {
+        &self.connection
+    }
 }
 
 /// The currently selected network path for an [`IrohSession`].
@@ -333,6 +350,7 @@ struct Connected {
 
 #[derive(Debug)]
 pub(crate) struct ToConnected {
+    connection: Connection,
     initial_meta: SessionMeta,
     rx_meta: mpsc::Receiver<SessionMeta>,
     rx_packet_from_backend: mpsc::UnboundedReceiver<RecvPacket>,
@@ -405,6 +423,7 @@ pub(crate) fn poll_connecting(
         let mut entity_commands = commands.entity(entity);
         entity_commands.remove::<Connecting>().insert((
             IrohIo {
+                connection: next.connection,
                 rx_meta: next.rx_meta,
                 rx_packet_from_backend: next.rx_packet_from_backend,
                 tx_packet_to_backend: next.tx_packet_to_backend,
@@ -645,6 +664,7 @@ async fn start_connected(
     let (tx_user_dc, rx_user_dc) = oneshot::channel();
     tx_connected
         .send(ToConnected {
+            connection: conn.clone(),
             initial_meta,
             rx_meta,
             rx_packet_from_backend,
