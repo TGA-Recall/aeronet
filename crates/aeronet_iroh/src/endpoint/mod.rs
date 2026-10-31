@@ -212,6 +212,7 @@ struct ToOpen {
 #[derive(Debug)]
 struct ToConnecting {
     peer_id: EndpointId,
+    connection_id: usize,
     tx_response: oneshot::Sender<session::SessionResponse>,
     rx_dc_reason: oneshot::Receiver<DisconnectReason>,
     rx_next: oneshot::Receiver<session::ToConnected>,
@@ -280,6 +281,7 @@ fn poll_opened(
                 entity,
                 session,
                 connecting.peer_id,
+                connecting.connection_id,
                 connecting.tx_response,
             ));
         }

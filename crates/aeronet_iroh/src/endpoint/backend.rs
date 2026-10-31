@@ -65,6 +65,7 @@ async fn accept_session(
     tx_connecting
         .send(ToConnecting {
             peer_id,
+            connection_id: conn.stable_id(),
             tx_response,
             rx_dc_reason,
             rx_next,

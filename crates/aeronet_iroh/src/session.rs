@@ -163,6 +163,12 @@ pub struct SessionRequest {
     pub session_entity: Entity,
     /// Authenticated identity of the remote Iroh endpoint.
     pub peer_id: EndpointId,
+    /// Stable ID of the exact connection, matching [`Connection::stable_id`].
+    ///
+    /// Use this to correlate admission decisions made in Iroh endpoint hooks.
+    /// The backend retains the connection while awaiting this response; do not
+    /// use the ID as an identity or authorization credential.
+    pub connection_id: usize,
     tx_response: Option<oneshot::Sender<SessionResponse>>,
 }
 
@@ -171,12 +177,14 @@ impl SessionRequest {
         endpoint_entity: Entity,
         session_entity: Entity,
         peer_id: EndpointId,
+        connection_id: usize,
         tx_response: oneshot::Sender<SessionResponse>,
     ) -> Self {
         Self {
             endpoint_entity,
             session_entity,
             peer_id,
+            connection_id,
             tx_response: Some(tx_response),
         }
     }

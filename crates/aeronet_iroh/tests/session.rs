@@ -31,6 +31,53 @@ enum RecordedDisconnect {
 #[derive(Debug, Default, Resource)]
 struct Disconnects(Vec<(Entity, RecordedDisconnect)>);
 
+#[derive(Debug, Default, Resource)]
+struct Requests(Vec<(Entity, usize)>);
+
+#[test]
+fn requests_identify_the_exact_connection() {
+    let mut app = test_app(SessionResponse::Accepted);
+    let endpoint_a = open_endpoint(&mut app);
+    let endpoint_b = open_endpoint(&mut app);
+    wait_until(&mut app, |world| {
+        world.get::<IrohEndpoint>(endpoint_a).is_some()
+            && world.get::<IrohEndpoint>(endpoint_b).is_some()
+    });
+    for count in 1..=2 {
+        let target = app.world().get::<IrohEndpoint>(endpoint_b).unwrap().addr();
+        let connect = app
+            .world()
+            .get::<IrohEndpoint>(endpoint_a)
+            .unwrap()
+            .connect(target, ALPN);
+        let outgoing = app.world_mut().spawn_empty().id();
+        connect.apply(app.world_mut().entity_mut(outgoing));
+        wait_until(&mut app, |world| {
+            world.resource::<Requests>().0.len() == count
+                && world
+                    .resource::<Requests>()
+                    .0
+                    .iter()
+                    .all(|(entity, _)| world.get::<IrohIo>(*entity).is_some())
+        });
+    }
+    let requests = &app.world().resource::<Requests>().0;
+    let [(_, first), (_, second)] = requests.as_slice() else {
+        panic!("expected two requests");
+    };
+    assert_ne!(first, second);
+    for &(entity, connection_id) in requests {
+        assert_eq!(
+            app.world()
+                .get::<IrohIo>(entity)
+                .unwrap()
+                .connection()
+                .stable_id(),
+            connection_id
+        );
+    }
+}
+
 #[test]
 fn connect_send_and_disconnect() {
     const PAYLOAD: &[u8] = b"hello over iroh";
@@ -258,9 +305,15 @@ fn test_app(response: SessionResponse) -> App {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, IrohPlugin))
         .init_resource::<Disconnects>()
-        .add_observer(move |mut request: On<SessionRequest>| {
-            request.respond(response.clone());
-        })
+        .init_resource::<Requests>()
+        .add_observer(
+            move |mut request: On<SessionRequest>, mut requests: ResMut<Requests>| {
+                requests
+                    .0
+                    .push((request.session_entity, request.connection_id));
+                request.respond(response.clone());
+            },
+        )
         .add_observer(
             |trigger: On<Disconnected>, mut disconnects: ResMut<Disconnects>| {
                 let reason = match &trigger.reason {
