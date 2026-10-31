@@ -6,13 +6,14 @@ use {
         connection::{Disconnect, DisconnectReason, Disconnected},
     },
     aeronet_iroh::{
-        IrohPlugin,
+        IrohPlugin, IrohRuntime,
         endpoint::IrohEndpoint,
-        session::{IrohSession, SessionRequest, SessionResponse, SessionSide},
+        session::{IrohIo, IrohSession, SessionRequest, SessionResponse, SessionSide},
     },
     bevy::{ecs::system::EntityCommand, prelude::*},
     bytes::Bytes,
     core::time::Duration,
+    futures::channel::oneshot,
     iroh::endpoint::presets,
     std::{thread, time::Instant},
 };
@@ -129,6 +130,128 @@ fn reject_incoming_session() {
             reason == &RecordedDisconnect::User(REJECTION_REASON.to_owned())
         })
     );
+}
+
+#[test]
+fn application_streams_are_separate_from_datagrams_and_close_with_the_session() {
+    const TOKEN: [u8; 2048] = [42; 2048];
+    const ACK: &[u8] = b"token received";
+    const DATAGRAM: &[u8] = b"gameplay datagram";
+
+    let mut app = test_app(SessionResponse::Accepted);
+    let endpoint_a = open_endpoint(&mut app);
+    let endpoint_b = open_endpoint(&mut app);
+    wait_until(&mut app, |world| {
+        world.get::<IrohEndpoint>(endpoint_a).is_some()
+            && world.get::<IrohEndpoint>(endpoint_b).is_some()
+    });
+    let target = app.world().get::<IrohEndpoint>(endpoint_b).unwrap().addr();
+    let connect = app
+        .world()
+        .get::<IrohEndpoint>(endpoint_a)
+        .unwrap()
+        .connect(target, ALPN);
+    let outgoing = app.world_mut().spawn_empty().id();
+    connect.apply(app.world_mut().entity_mut(outgoing));
+    assert!(app.world().get::<IrohIo>(outgoing).is_none());
+    wait_until(&mut app, |world| world.get::<Session>(outgoing).is_some());
+    let incoming = find_session(app.world_mut(), SessionSide::Incoming);
+    wait_until(&mut app, |world| world.get::<Session>(incoming).is_some());
+
+    let outgoing_connection = app
+        .world()
+        .get::<IrohIo>(outgoing)
+        .unwrap()
+        .connection()
+        .clone();
+    let incoming_connection = app
+        .world()
+        .get::<IrohIo>(incoming)
+        .unwrap()
+        .connection()
+        .clone();
+    assert_eq!(
+        outgoing_connection.remote_id(),
+        app.world().get::<IrohSession>(outgoing).unwrap().peer_id()
+    );
+    assert_eq!(
+        incoming_connection.remote_id(),
+        app.world().get::<IrohSession>(incoming).unwrap().peer_id()
+    );
+
+    let (tx, mut rx) = oneshot::channel();
+    app.world().resource::<IrohRuntime>().spawn_on_self({
+        let outgoing_connection = outgoing_connection.clone();
+        let incoming_connection = incoming_connection.clone();
+        async move {
+            type StreamError = Box<dyn core::error::Error + Send + Sync>;
+            let result = futures::try_join!(
+                async {
+                    let (mut send, mut recv) = outgoing_connection.open_bi().await?;
+                    send.write_all(&TOKEN).await?;
+                    send.finish()?;
+                    Ok::<_, StreamError>(recv.read_to_end(ACK.len()).await?)
+                },
+                async {
+                    let (mut send, mut recv) = incoming_connection.accept_bi().await?;
+                    let token = recv.read_to_end(TOKEN.len()).await?;
+                    send.write_all(ACK).await?;
+                    send.finish()?;
+                    Ok::<_, StreamError>(token)
+                },
+            );
+            _ = tx.send(result.map_err(|error| error.to_string()));
+        }
+    });
+    let mut received = None;
+    wait_until(&mut app, |world| {
+        for entity in [outgoing, incoming] {
+            assert!(world.get::<Session>(entity).unwrap().recv.is_empty());
+        }
+        received = rx.try_recv().expect("stream task should finish");
+        received.is_some()
+    });
+    let (ack, token) = received.unwrap().unwrap();
+    assert_eq!(ack, ACK);
+    assert_eq!(token, TOKEN);
+
+    app.world_mut()
+        .get_mut::<Session>(outgoing)
+        .unwrap()
+        .send
+        .push(Bytes::from_static(DATAGRAM));
+    wait_until(&mut app, |world| {
+        world
+            .get::<Session>(incoming)
+            .unwrap()
+            .recv
+            .iter()
+            .any(|packet| packet.payload == DATAGRAM)
+    });
+
+    let (tx, mut rx) = oneshot::channel();
+    app.world().resource::<IrohRuntime>().spawn_on_self({
+        let connection = incoming_connection.clone();
+        async move {
+            _ = tx.send(connection.accept_bi().await.is_err());
+        }
+    });
+    app.world_mut()
+        .trigger(Disconnect::new(outgoing, "test complete"));
+    let mut pending_stream_failed = false;
+    wait_until(&mut app, |world| {
+        if !pending_stream_failed
+            && let Some(failed) = rx.try_recv().expect("stream task should finish")
+        {
+            assert!(failed, "accepting a stream should fail after disconnect");
+            pending_stream_failed = true;
+        }
+        world.get_entity(outgoing).is_err()
+            && world.get_entity(incoming).is_err()
+            && pending_stream_failed
+    });
+    assert!(outgoing_connection.close_reason().is_some());
+    assert!(incoming_connection.close_reason().is_some());
 }
 
 fn test_app(response: SessionResponse) -> App {
